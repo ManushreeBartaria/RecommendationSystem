@@ -23,6 +23,7 @@ USERS_FILE = os.path.join(DATA_PATH, "users.csv")
 PRODUCTS_FILE = os.path.join(DATA_PATH, "products.csv")
 INTERACTIONS_FILE = os.path.join(DATA_PATH, "interaction_events.csv")
 ARTIFACT_FILE = os.path.join(DATA_PATH, "fashion_recommender_artifacts.joblib")
+RL_QTABLE_FILE = os.path.join(DATA_PATH, "fashion_recommender_q_table.joblib")
 
 EVENT_WEIGHTS = {
     "view": 1.0,
@@ -331,6 +332,115 @@ def recommend_for_user(
     return ranked.sort_values("recommendation_score", ascending=False).head(top_n).reset_index(drop=True)
 
 
+# ---------------- Reinforcement learning (Q-learning) ----------------
+RL_REWARDS = {
+    "view": 0.1,
+    "click": 0.25,
+    "wishlist": 0.6,
+    "add_to_cart": 0.8,
+    "purchase": 1.0,
+    "not_interested": -1.0,
+}
+RL_ALPHA = 0.15
+RL_GAMMA = 0.80
+RL_Q_TABLE = {}
+
+
+def _budget_bucket(user_row):
+    """Use the user's preferred maximum price as a coarse state feature."""
+    if user_row is None:
+        return "budget_unknown"
+    value = pd.to_numeric(pd.Series([user_row.get("preferred_max_price")]), errors="coerce").iloc[0]
+    if pd.isna(value):
+        return "budget_unknown"
+    if value < 1000:
+        return "budget_low"
+    if value < 3000:
+        return "budget_mid"
+    return "budget_high"
+
+
+def _engagement_bucket(interaction_count):
+    if interaction_count < 5:
+        return "activity_new"
+    if interaction_count < 25:
+        return "activity_low"
+    return "activity_high"
+
+
+def build_rl_state(user_id, users, interactions, product_catalog):
+    """Create the same compact state representation used during RL training."""
+    uid = str(user_id).strip()
+    user_rows = users[users["user_id"].astype(str).str.strip().eq(uid)]
+    user_row = user_rows.iloc[0] if not user_rows.empty else None
+    history = interactions[interactions["user_id"].astype(str).str.strip().eq(uid)].copy()
+    if "timestamp" in history.columns:
+        history = history.sort_values("timestamp")
+    recent_category = "category_unknown"
+    if not history.empty and "product_id" in history.columns and "category" in product_catalog.columns:
+        lookup = product_catalog[["product_id", "category"]].copy()
+        lookup["product_id"] = lookup["product_id"].astype(str)
+        last_pid = str(history.iloc[-1]["product_id"])
+        found = lookup.loc[lookup["product_id"].eq(last_pid), "category"]
+        if not found.empty and pd.notna(found.iloc[0]) and str(found.iloc[0]).strip():
+            recent_category = str(found.iloc[0]).strip().lower().replace("|", "_")
+    return f"{recent_category}|{_budget_bucket(user_row)}|{_engagement_bucket(len(history))}"
+
+
+def _q_value(q_table, state, product_id):
+    """Support nested dicts and tuple-key dicts."""
+    row = q_table.get(state, {})
+    if isinstance(row, dict):
+        return float(row.get(str(product_id), 0.0))
+    return float(q_table.get((state, str(product_id)), 0.0))
+
+
+def _update_q_value(q_table, state, product_id, reward, next_state, alpha=RL_ALPHA, gamma=RL_GAMMA):
+    """One tabular Q-learning update; unseen state-action pairs start at zero."""
+    state, next_state, product_id = str(state), str(next_state), str(product_id)
+    if state not in q_table or not isinstance(q_table.get(state), dict):
+        q_table[state] = {}
+    current = float(q_table[state].get(product_id, 0.0))
+    next_row = q_table.get(next_state, {})
+    next_best = max((float(v) for v in next_row.values()), default=0.0) if isinstance(next_row, dict) else 0.0
+    q_table[state][product_id] = current + alpha * (float(reward) + gamma * next_best - current)
+    return q_table[state][product_id]
+
+
+# Keep the original hybrid ranker as candidate generator; Q-learning reranks its candidates.
+_hybrid_recommend_for_user = recommend_for_user
+
+
+def recommend_for_user(*args, **kwargs):
+    """Generate hybrid candidates, then rerank using learned Q-values when available."""
+    top_n = int(kwargs.get("top_n", 10))
+    user_id = args[0] if args else kwargs.get("user_id")
+    users_arg = args[1] if len(args) > 1 else kwargs.get("users")
+    interactions_arg = args[2] if len(args) > 2 else kwargs.get("interactions")
+    catalog_arg = args[3] if len(args) > 3 else kwargs.get("product_catalog")
+    candidates_n = min(max(top_n * 5, 50), len(catalog_arg)) if catalog_arg is not None else max(top_n * 5, 50)
+    candidate_kwargs = dict(kwargs)
+    candidate_kwargs["top_n"] = candidates_n
+    candidates = _hybrid_recommend_for_user(*args, **candidate_kwargs)
+    if candidates.empty or not RL_Q_TABLE:
+        return candidates.head(top_n).reset_index(drop=True)
+    state = build_rl_state(user_id, users_arg, interactions_arg, catalog_arg)
+    candidates = candidates.copy()
+    candidates["rl_q_value"] = candidates["product_id"].astype(str).map(
+        lambda pid: _q_value(RL_Q_TABLE, state, pid)
+    )
+    # Normalize the Q values over this candidate set before blending with the hybrid score.
+    q = pd.to_numeric(candidates["rl_q_value"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    if len(q) and q.max() > q.min():
+        q_norm = (q - q.min()) / (q.max() - q.min())
+    else:
+        q_norm = np.zeros(len(q), dtype=float)
+    candidates["rl_score"] = q_norm
+    candidates["hybrid_score_before_rl"] = candidates["recommendation_score"]
+    candidates["recommendation_score"] = 0.80 * candidates["recommendation_score"] + 0.20 * candidates["rl_score"]
+    return candidates.sort_values("recommendation_score", ascending=False).head(top_n).reset_index(drop=True)
+
+
 # Load source CSVs for user history, activity analytics, and profile preferences.
 try:
     users, csv_products, interactions = load_data()
@@ -346,6 +456,11 @@ require_columns(interactions, ["user_id", "product_id", "event_type"], "Interact
 # exported from Colab. No TF-IDF or SVD training happens in this app.
 try:
     product_catalog, tfidf_matrix, product_to_index, content_vectorizer, cf_model = load_model_artifact()
+    # Prefer a separately updated Q-table; otherwise load the initial table exported from Colab.
+    artifact_for_rl = joblib.load(ARTIFACT_FILE)
+    RL_Q_TABLE = artifact_for_rl.get("rl_q_table", {})
+    if os.path.exists(RL_QTABLE_FILE):
+        RL_Q_TABLE = joblib.load(RL_QTABLE_FILE)
 except Exception as exc:
     st.error(f"Could not load the trained Colab model: {exc}")
     st.stop()
@@ -354,7 +469,7 @@ except Exception as exc:
 products = csv_products
 
 st.title("👕 Fashion Recommendation System")
-st.caption("Hybrid recommendations combine content similarity, collaborative filtering, and product popularity.")
+st.caption("Hybrid recommendations combine TF-IDF, SVD and popularity, with a Q-learning layer that adapts from feedback.")
 
 menu = st.sidebar.radio(
     "Navigation",
@@ -523,14 +638,43 @@ elif menu == "User Recommendations":
         ]
         score_cols = [col for col in score_cols if col in recs.columns]
         st.dataframe(
-            recs[score_cols].style.format({
+            recs[score_cols + [c for c in ["rl_q_value", "rl_score", "hybrid_score_before_rl"] if c in recs.columns]].style.format({
                 "content_score": "{:.3f}",
                 "collaborative_score": "{:.3f}",
                 "popularity_score": "{:.3f}",
                 "recommendation_score": "{:.3f}",
+                "rl_q_value": "{:.3f}",
+                "rl_score": "{:.3f}",
+                "hybrid_score_before_rl": "{:.3f}",
             }, na_rep="N/A"),
             use_container_width=True,
         )
+
+        st.subheader("Teach the recommender from feedback")
+        st.caption("Choose feedback for a product that was actually shown. This updates and saves the Q-table for future recommendations.")
+        feedback_product = st.selectbox(
+            "Product receiving feedback",
+            recs["product_id"].astype(str).tolist(),
+            format_func=lambda pid: str(recs.loc[recs["product_id"].astype(str).eq(pid), "product_name"].iloc[0]) if "product_name" in recs.columns and not recs.loc[recs["product_id"].astype(str).eq(pid)].empty else pid,
+            key="rl_feedback_product",
+        )
+        feedback_event = st.selectbox(
+            "Observed user response",
+            ["click", "wishlist", "add_to_cart", "purchase", "not_interested", "view"],
+            format_func=lambda x: {"click":"Clicked", "wishlist":"Added to wishlist", "add_to_cart":"Added to cart", "purchase":"Purchased", "not_interested":"Not interested", "view":"Viewed"}[x],
+            key="rl_feedback_event",
+        )
+        if st.button("Update Q-learning model", type="primary"):
+            current_state = build_rl_state(selected_user, users, interactions, product_catalog)
+            pid_row = product_catalog.loc[product_catalog["product_id"].astype(str).eq(str(feedback_product))]
+            category = str(pid_row.iloc[0].get("category", "category_unknown")).strip().lower().replace("|", "_") if not pid_row.empty else "category_unknown"
+            next_state = f"{category}|{_budget_bucket(users.loc[users['user_id'].astype(str).eq(str(selected_user))].iloc[0] if not users.loc[users['user_id'].astype(str).eq(str(selected_user))].empty else None)}|{_engagement_bucket(len(history) + 1)}"
+            reward = RL_REWARDS[feedback_event]
+            new_q = _update_q_value(RL_Q_TABLE, current_state, str(feedback_product), reward, next_state)
+            os.makedirs(DATA_PATH, exist_ok=True)
+            joblib.dump(RL_Q_TABLE, RL_QTABLE_FILE, compress=3)
+            st.success(f"Q-value updated for this user state and product. Reward: {reward:+.2f}; new Q-value: {new_q:.3f}. Saved for future sessions.")
+            st.rerun()
 
 elif menu == "Interaction Analytics":
     st.header("📈 Interaction Analytics")
